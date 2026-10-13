@@ -1,0 +1,130 @@
+#!/bin/bash
+#
+# check_ntrip_clients - Nagios plugin to check the number of clients connected
+# to a local NTRIP caster (e.g. RTKLIB str2str "ntripc://", as used by RTKBase).
+#
+# Copyright (C) 2026 Thomas Wagner <thomas.wagner@jku.at>
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, write to the Free Software Foundation, Inc.,
+# 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+#
+# str2str accepts at most 32 clients per caster and never times out clients
+# that connect without sending a valid request. Once all slots are taken, new
+# clients (including real rovers) can no longer connect although the service
+# is still running. This plugin reports:
+#   - clients: connections accepted on the caster port
+#   - stale:   clients that have not been sent any data for longer than the
+#              stale age (served rovers receive data every second, so these
+#              are usually scanners holding a slot)
+#   - backlog: pending connections in the listen queue (full = new clients
+#              are dropped by the kernel)
+
+PROGNAME=$(basename "$0")
+
+STATE_OK=0
+STATE_WARNING=1
+STATE_CRITICAL=2
+STATE_UNKNOWN=3
+
+PORT=8080
+MAX_CLIENTS=32
+WARNING=24
+CRITICAL=30
+STALE_AGE=300
+
+print_usage() {
+    echo "Usage: $PROGNAME [-p <port>] [-w <warning>] [-c <critical>] [-m <max>] [-a <seconds>]"
+    echo ""
+    echo "  -p <port>      TCP port of the NTRIP caster (default: $PORT)"
+    echo "  -w <warning>   Warning threshold for connected clients (default: $WARNING)"
+    echo "  -c <critical>  Critical threshold for connected clients (default: $CRITICAL)"
+    echo "  -m <max>       Maximum number of clients of the caster (default: $MAX_CLIENTS)"
+    echo "  -a <seconds>   Clients without data sent for this long count as stale (default: $STALE_AGE)"
+    echo "  -h             Show this help message"
+}
+
+while getopts "p:w:c:m:a:h" opt; do
+    case $opt in
+        p) PORT=$OPTARG ;;
+        w) WARNING=$OPTARG ;;
+        c) CRITICAL=$OPTARG ;;
+        m) MAX_CLIENTS=$OPTARG ;;
+        a) STALE_AGE=$OPTARG ;;
+        h) print_usage; exit $STATE_OK ;;
+        *) print_usage; exit $STATE_UNKNOWN ;;
+    esac
+done
+
+for v in "$PORT" "$WARNING" "$CRITICAL" "$MAX_CLIENTS" "$STALE_AGE"; do
+    if ! [[ "$v" =~ ^[0-9]+$ ]]; then
+        echo "UNKNOWN: All arguments must be non-negative integers"
+        exit $STATE_UNKNOWN
+    fi
+done
+
+if [ "$WARNING" -ge "$CRITICAL" ]; then
+    echo "UNKNOWN: Warning threshold must be less than critical threshold"
+    exit $STATE_UNKNOWN
+fi
+
+if ! command -v ss >/dev/null 2>&1; then
+    echo "UNKNOWN: ss (iproute2) not found"
+    exit $STATE_UNKNOWN
+fi
+
+# Listening socket(s): "LISTEN <queued> <backlog> <local> <peer>"
+LISTEN=$(ss -Htln "( sport = :$PORT )")
+if [ -z "$LISTEN" ]; then
+    echo "CRITICAL: Nothing is listening on port $PORT"
+    exit $STATE_CRITICAL
+fi
+read -r QUEUED BACKLOG < <(echo "$LISTEN" | awk '{q += $2; b += $3} END {print q, b}')
+
+# Connections; ss prints a socket line followed by an indented info line
+# containing lastsnd:<ms since last data sent>. Only sockets owned by a
+# process (users:(...)) have been accepted by the caster, the others are
+# still waiting in the listen queue. ss shows the owner only to the same
+# user or root.
+read -r SOCKETS CLIENTS STALE < <(
+    ss -Htnpio state established state close-wait "( sport = :$PORT )" |
+    awk -v stale_ms=$((STALE_AGE * 1000)) '
+        /^[^ \t]/ { sockets++; owned = /users:/; clients += owned }
+        /^[ \t]/ && owned && match($0, /lastsnd:[0-9]+/) {
+            if (substr($0, RSTART + 8, RLENGTH - 8) + 0 > stale_ms) stale++
+        }
+        END { print sockets + 0, clients + 0, stale + 0 }'
+)
+
+if [ "$SOCKETS" -gt 0 ] && [ "$CLIENTS" -eq 0 ]; then
+    echo "UNKNOWN: Cannot see the owner of connections on port $PORT, run as the caster user or root"
+    exit $STATE_UNKNOWN
+fi
+
+STATE=$STATE_OK
+LABEL="OK"
+if [ "$CLIENTS" -ge "$CRITICAL" ] || [ "$QUEUED" -ge "$BACKLOG" ]; then
+    STATE=$STATE_CRITICAL
+    LABEL="CRITICAL"
+elif [ "$CLIENTS" -ge "$WARNING" ]; then
+    STATE=$STATE_WARNING
+    LABEL="WARNING"
+fi
+
+MSG="${CLIENTS}/${MAX_CLIENTS} clients connected, ${STALE} stale (no data for >${STALE_AGE}s)"
+if [ "$QUEUED" -ge "$BACKLOG" ]; then
+    MSG="${MSG}, listen queue full (${QUEUED}/${BACKLOG}) - new clients are rejected"
+fi
+
+echo "${LABEL}: ${MSG} | clients=${CLIENTS};${WARNING};${CRITICAL};0;${MAX_CLIENTS} stale=${STALE};;;0;${MAX_CLIENTS} backlog=${QUEUED};;${BACKLOG};0;"
+exit $STATE

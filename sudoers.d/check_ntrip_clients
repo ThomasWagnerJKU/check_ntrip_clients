@@ -1,0 +1,15 @@
+# /etc/sudoers.d/check_ntrip_clients
+#
+# Allow the monitoring user to run check_ntrip_clients with root privileges.
+# The plugin needs root (or the user running the caster) to see which
+# process owns the connections on the caster port (ss -p).
+#
+# Replace "nagios" if your monitoring system logs in with a different user.
+# Install with mode 0440 and check with: visudo -cf <file>
+
+Cmnd_Alias CHECK_NTRIP_CLIENTS = /usr/lib/nagios/plugins/check_ntrip_clients
+
+nagios ALL=(root) NOPASSWD: CHECK_NTRIP_CLIENTS
+
+# Uncomment to keep the periodic checks out of the auth log (sudo >= 1.9.0):
+#Defaults!CHECK_NTRIP_CLIENTS !log_allowed
